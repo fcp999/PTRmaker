@@ -84,4 +84,4 @@ Synthetic PTR answers are deliberately not marked authoritative. They represent 
 
 ## License
 
-No license has been selected yet.
+MIT License. See [LICENSE](LICENSE).
