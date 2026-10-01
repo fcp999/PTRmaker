@@ -1,7 +1,6 @@
-__pycache__/
-*.py[cod]
+ptrmaker
+ptrmaker.exe
 *.db
 *.db-shm
 *.db-wal
-.venv/
-venv/
+.DS_Store
