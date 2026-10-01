@@ -20,6 +20,12 @@ This is especially useful when reverse DNS otherwise collapses cloud-hosted serv
 - Retains historical hostname/IP observations after expiry while excluding them from active synthetic PTR answers
 - Ignores RFC 8145-style `_ta-*` trust-anchor signaling for learned hostname mappings
 - Single compiled binary; no Python runtime or virtual environment required
+- Built-in HTTP status dashboard
+- JSON lookup API for current and historical mappings
+- Prometheus-compatible metrics endpoint
+- Health endpoint for monitoring
+- Optional JSON-line logging
+- systemd service and installer
 
 ## Requirements
 
@@ -71,7 +77,85 @@ sudo ./ptrmaker   --listen 0.0.0.0:53   --upstream 192.168.0.2:53   --database /
 --listen      DNS listen address      default: 0.0.0.0:53
 --upstream    upstream DNS server     default: 192.168.0.2:53
 --database    SQLite database path    default: ptrmaker.db
---ptr-ttl     synthetic PTR TTL       default: 60
+--ptr-ttl       synthetic PTR TTL                default: 60
+--http-listen   HTTP dashboard/API/metrics bind   default: 127.0.0.1:8080
+--json-logs     emit structured JSON logs         default: false
+```
+
+## HTTP dashboard and API
+
+By default PTRmaker exposes the local status service at:
+
+```text
+http://127.0.0.1:8080/
+```
+
+Bind it to the LAN if desired:
+
+```bash
+./ptrmaker --http-listen 0.0.0.0:8080 --upstream 192.168.0.2:53
+```
+
+Useful endpoints:
+
+```text
+/                              status dashboard
+/healthz                       health check
+/metrics                       Prometheus metrics
+/api/v1/lookup/203.0.113.10    all learned names for an IP
+/api/v1/recent?limit=100       recent learned mappings
+/api/v1/authorities?limit=100  recent authority records
+```
+
+Example:
+
+```bash
+curl http://127.0.0.1:8080/api/v1/lookup/203.0.113.10
+curl http://127.0.0.1:8080/metrics
+```
+
+The HTTP service defaults to loopback intentionally. If you bind it to `0.0.0.0`, protect it with your firewall or reverse proxy because the API exposes observed DNS mappings.
+
+## JSON logging
+
+```bash
+./ptrmaker --json-logs --upstream 192.168.0.2:53
+```
+
+Each log entry is emitted as one JSON object, which makes PTRmaker less offensive to log collectors.
+
+## systemd installation
+
+On a Linux system with Go installed:
+
+```bash
+git clone https://github.com/fcp999/PTRmaker.git
+cd PTRmaker
+sudo bash install.sh
+```
+
+The installer:
+
+- builds and installs `/usr/local/bin/ptrmaker`
+- creates an unprivileged `ptrmaker` service account
+- stores the database under `/var/lib/ptrmaker`
+- installs `/etc/ptrmaker/ptrmaker.env`
+- installs and enables the hardened systemd service
+- grants only `CAP_NET_BIND_SERVICE` so PTRmaker can bind port 53 without running as root
+
+Edit the runtime arguments:
+
+```bash
+sudo vi /etc/ptrmaker/ptrmaker.env
+sudo systemctl restart ptrmaker
+```
+
+Operational commands:
+
+```bash
+systemctl status ptrmaker
+journalctl -u ptrmaker -f
+curl http://127.0.0.1:8080/healthz
 ```
 
 ## PTR preference
