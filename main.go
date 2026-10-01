@@ -319,14 +319,18 @@ func (a *App) learn(req, resp *dns.Msg) error {
 		case *dns.A:
 			ip := v.A.String()
 			addresses[owner] = append(addresses[owner], ipRecord{ip, ttl})
-			if err := a.store.LearnName(ip, owner, "answer", ttl); err != nil {
-				return err
+			if owner != qname {
+				if err := a.store.LearnName(ip, owner, "answer", ttl); err != nil {
+					return err
+				}
 			}
 		case *dns.AAAA:
 			ip := v.AAAA.String()
 			addresses[owner] = append(addresses[owner], ipRecord{ip, ttl})
-			if err := a.store.LearnName(ip, owner, "answer", ttl); err != nil {
-				return err
+			if owner != qname {
+				if err := a.store.LearnName(ip, owner, "answer", ttl); err != nil {
+					return err
+				}
 			}
 		case *dns.CNAME:
 			cnames[owner] = cnameLink{normalizeName(v.Target), ttl}
@@ -398,6 +402,15 @@ func (a *App) learn(req, resp *dns.Msg) error {
 		}
 		for _, alias := range aliases[1:max(1, len(aliases)-1)] {
 			if err := a.store.LearnName(rec.ip, alias, "cname", rec.ttl); err != nil {
+				return err
+			}
+		}
+		// Record the canonical (final) name in the CNAME chain at
+		// "answer" priority. It is neither the queried name nor an
+		// intermediate alias, so the loop above never stores it; without
+		// this an AWS/CDN canonical name is dropped entirely.
+		if current != qname {
+			if err := a.store.LearnName(rec.ip, current, "answer", rec.ttl); err != nil {
 				return err
 			}
 		}
