@@ -4,7 +4,6 @@ import (
 	"database/sql"
 	"flag"
 	"fmt"
-	"log"
 	"net"
 	"os"
 	"os/signal"
@@ -221,15 +220,17 @@ type App struct {
 	store     *Store
 	upstream  string
 	ptrTTL    uint32
+	metrics   *Metrics
 	udpClient *dns.Client
 	tcpClient *dns.Client
 }
 
-func NewApp(store *Store, upstream string, ptrTTL uint32) *App {
+func NewApp(store *Store, upstream string, ptrTTL uint32, metrics *Metrics) *App {
 	return &App{
 		store:     store,
 		upstream:  upstream,
 		ptrTTL:    ptrTTL,
+		metrics:   metrics,
 		udpClient: &dns.Client{Net: "udp", Timeout: upstreamTimeout},
 		tcpClient: &dns.Client{Net: "tcp", Timeout: upstreamTimeout},
 	}
@@ -241,7 +242,11 @@ func (a *App) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 		return
 	}
 
+	network := w.RemoteAddr().Network()
+	a.metrics.ObserveQuery(network, req.Question[0].Qtype)
+
 	if msg, ok := a.syntheticPTR(req); ok {
+		a.metrics.syntheticPTRHits.Add(1)
 		_ = w.WriteMsg(msg)
 		return
 	}
@@ -251,21 +256,27 @@ func (a *App) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 		client = a.tcpClient
 	}
 
+	started := time.Now()
 	resp, _, err := client.Exchange(req, a.upstream)
+	a.metrics.ObserveUpstream(time.Since(started))
 	if client == a.udpClient && err == nil && resp != nil && resp.Truncated {
+		a.metrics.tcpFallbacks.Add(1)
+		started = time.Now()
 		resp, _, err = a.tcpClient.Exchange(req, a.upstream)
+		a.metrics.ObserveUpstream(time.Since(started))
 	}
 	if err != nil || resp == nil {
-		log.Printf("upstream failure: %v", err)
+		a.metrics.upstreamErrors.Add(1)
+		logf("upstream failure: %v", err)
 		dns.HandleFailed(w, req)
 		return
 	}
 
 	if err := a.learn(req, resp); err != nil {
-		log.Printf("learning error: %v", err)
+		logf("learning error: %v", err)
 	}
 	if err := w.WriteMsg(resp); err != nil {
-		log.Printf("write response: %v", err)
+		logf("write response: %v", err)
 	}
 }
 
@@ -280,7 +291,7 @@ func (a *App) syntheticPTR(req *dns.Msg) (*dns.Msg, bool) {
 	}
 	name, ok, err := a.store.BestName(ip)
 	if err != nil {
-		log.Printf("PTR lookup error: %v", err)
+		logf("PTR lookup error: %v", err)
 		return nil, false
 	}
 	if !ok {
@@ -293,7 +304,7 @@ func (a *App) syntheticPTR(req *dns.Msg) (*dns.Msg, bool) {
 		Hdr: dns.RR_Header{Name: q.Name, Rrtype: dns.TypePTR, Class: dns.ClassINET, Ttl: a.ptrTTL},
 		Ptr: dns.Fqdn(name),
 	})
-	log.Printf("SYNTH-PTR ip=%s name=%s", ip, name)
+	logf("SYNTH-PTR ip=%s name=%s", ip, name)
 	return m, true
 }
 
@@ -414,7 +425,7 @@ func (a *App) learn(req, resp *dns.Msg) error {
 				return err
 			}
 		}
-		log.Printf("LEARN query=%s ip=%s canonical=%s", qname, rec.ip, current)
+		logf("LEARN query=%s ip=%s canonical=%s", qname, rec.ip, current)
 	}
 	return nil
 }
@@ -434,11 +445,11 @@ func (a *App) resolveAuthorityIPs(ns string) {
 			switch v := rr.(type) {
 			case *dns.A:
 				if err := a.store.LearnName(v.A.String(), ns, "authority", rr.Header().Ttl); err != nil {
-					log.Printf("authority A learn %s: %v", ns, err)
+					logf("authority A learn %s: %v", ns, err)
 				}
 			case *dns.AAAA:
 				if err := a.store.LearnName(v.AAAA.String(), ns, "authority", rr.Header().Ttl); err != nil {
-					log.Printf("authority AAAA learn %s: %v", ns, err)
+					logf("authority AAAA learn %s: %v", ns, err)
 				}
 			}
 		}
@@ -488,28 +499,43 @@ func main() {
 	upstream := flag.String("upstream", "192.168.0.2:53", "upstream DNS server")
 	dbPath := flag.String("database", defaultDB, "SQLite database path")
 	ptrTTL := flag.Uint("ptr-ttl", defaultPTRTTL, "synthetic PTR TTL")
+	httpListen := flag.String("http-listen", "127.0.0.1:8080", "HTTP status/API/metrics listen address; empty disables")
+	jsonLog := flag.Bool("json-logs", false, "emit logs as one JSON object per line")
 	flag.Parse()
+	setJSONLogging(*jsonLog)
 
 	store, err := NewStore(*dbPath)
 	if err != nil {
-		log.Fatalf("database: %v", err)
+		fatalf("database: %v", err)
 	}
 	defer store.Close()
 
-	app := NewApp(store, *upstream, uint32(*ptrTTL))
+	metrics := NewMetrics()
+	app := NewApp(store, *upstream, uint32(*ptrTTL), metrics)
 	udp := &dns.Server{Addr: *listen, Net: "udp", Handler: app}
 	tcp := &dns.Server{Addr: *listen, Net: "tcp", Handler: app}
 
-	errCh := make(chan error, 2)
-	go func() { log.Printf("PTRmaker UDP listening on %s", *listen); errCh <- udp.ListenAndServe() }()
-	go func() { log.Printf("PTRmaker TCP listening on %s", *listen); errCh <- tcp.ListenAndServe() }()
+	errCh := make(chan error, 3)
+	go func() { logf("PTRmaker UDP listening on %s", *listen); errCh <- udp.ListenAndServe() }()
+	go func() { logf("PTRmaker TCP listening on %s", *listen); errCh <- tcp.ListenAndServe() }()
+
+	var web *WebServer
+	if *httpListen != "" {
+		web = NewWebServer(*httpListen, store, metrics)
+		go func() {
+			logf("PTRmaker HTTP listening on %s", *httpListen)
+			if err := web.ListenAndServe(); err != nil && err.Error() != "http: Server closed" {
+				errCh <- err
+			}
+		}()
+	}
 
 	go func() {
 		t := time.NewTicker(5 * time.Minute)
 		defer t.Stop()
 		for range t.C {
 			if err := store.Cleanup(); err != nil {
-				log.Printf("cleanup: %v", err)
+				logf("cleanup: %v", err)
 			}
 		}
 	}()
@@ -518,13 +544,16 @@ func main() {
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	select {
 	case sig := <-sigCh:
-		log.Printf("shutting down on %s", sig)
+		logf("shutting down on %s", sig)
 	case err := <-errCh:
 		if err != nil {
-			log.Printf("server stopped: %v", err)
+			logf("server stopped: %v", err)
 		}
 	}
 	_ = udp.Shutdown()
 	_ = tcp.Shutdown()
+	if web != nil {
+		_ = web.Shutdown()
+	}
 	fmt.Println("PTRmaker stopped")
 }
